@@ -3,7 +3,7 @@ use std::env;
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 
@@ -54,6 +54,9 @@ const PDEFLATE_DIR_ARCHIVE_RECORD_DIR: u8 = 2;
 const PDEFLATE_DIR_FILE_MAGIC: [u8; 4] = *b"CZPD";
 const PDEFLATE_DIR_FILE_VERSION_V1: u8 = 1;
 const PDEFLATE_DIR_FILE_VERSION_V2: u8 = 2;
+const ZIP_DIR_VERIFY_TRACE_ENV: &str = "COZIP_ZIP_DIR_VERIFY_TRACE";
+
+static ZIP_DIR_VERIFY_TRACE_LINES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct ZipOptions {
@@ -1046,145 +1049,205 @@ impl CoZip {
         }
         match &self.backend {
             CoZipBackend::Zip { deflate, .. } => {
-                let files = collect_files_recursively(input_dir)?;
-                let total_bytes = files.iter().try_fold(0_u64, |acc, path| {
-                    Ok::<u64, CoZipError>(acc.saturating_add(std::fs::metadata(path)?.len()))
-                })?;
-                if let Some(progress) = &progress {
-                    progress.start(
-                        CoZipProgressOperation::Compress,
-                        CoZipProgressTarget::Directory,
-                        Some(files.len()),
-                        Some(total_bytes),
-                    );
+                if zip_dir_verify_trace_enabled() {
+                    zip_dir_verify_trace_reset();
+                    zip_dir_verify_trace_log(format!(
+                        "[zip_dir_verify] begin output={} trace_path={}",
+                        output_path.as_ref().display(),
+                        zip_dir_verify_trace_path().display()
+                    ));
                 }
-                let output = StdFile::create(output_path)?;
-                let mut writer = BufWriter::new(output);
-                let mut state = ZipWriteState::default();
-                let spool_root = std::env::temp_dir().join(format!(
-                    "cozip-zip-dir-compress-{}-{}",
-                    std::process::id(),
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_err(|_| CoZipError::InvalidZip("system time before unix epoch"))?
-                        .as_millis()
-                ));
-                std::fs::create_dir_all(&spool_root)?;
-                let tasks: Vec<(usize, PathBuf, String, u64)> = files
-                    .iter()
-                    .enumerate()
-                    .map(|(index, file)| {
-                        let rel = file
-                            .strip_prefix(input_dir)
-                            .map_err(|_| CoZipError::InvalidZip("failed to compute relative path"))?;
-                        let entry_name = zip_name_from_relative_path(rel)?;
-                        let file_len = std::fs::metadata(file)?.len();
-                        Ok((index, file.clone(), entry_name, file_len))
-                    })
-                    .collect::<Result<_, CoZipError>>()?;
-                let concurrency = match &self.backend {
-                    CoZipBackend::Zip {
-                        parallel_read_threads,
-                        ..
-                    } => (*parallel_read_threads).max(1),
-                    _ => 1,
-                };
-                let per_task_backlog =
-                    (2_u64 * 1024 * 1024 * 1024 / concurrency as u64).max(4 * 1024 * 1024);
-                let shared_queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
-                let (result_tx, result_rx) = std::sync::mpsc::channel();
-                thread::scope(|scope| {
-                    for worker_id in 0..concurrency {
-                        let queue_ref = Arc::clone(&shared_queue);
-                        let tx_ref = result_tx.clone();
-                        let progress_ref = progress.clone();
-                        let deflate_ref = deflate.clone();
-                        let spool_path = spool_root.join(format!("worker-{worker_id:02}.bin"));
-                        scope.spawn(move || loop {
-                            let task = {
-                                let mut queue = match queue_ref.lock() {
-                                    Ok(queue) => queue,
-                                    Err(_) => return,
+                let result: Result<CoZipStats, CoZipError> = (|| {
+                    let files = collect_files_recursively(input_dir)?;
+                    let total_bytes = files.iter().try_fold(0_u64, |acc, path| {
+                        Ok::<u64, CoZipError>(acc.saturating_add(std::fs::metadata(path)?.len()))
+                    })?;
+                    if let Some(progress) = &progress {
+                        progress.start(
+                            CoZipProgressOperation::Compress,
+                            CoZipProgressTarget::Directory,
+                            Some(files.len()),
+                            Some(total_bytes),
+                        );
+                    }
+                    let output = StdFile::create(&output_path)?;
+                    let mut writer = BufWriter::new(output);
+                    let mut state = ZipWriteState::default();
+                    let spool_root = std::env::temp_dir().join(format!(
+                        "cozip-zip-dir-compress-{}-{}",
+                        std::process::id(),
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_err(|_| CoZipError::InvalidZip("system time before unix epoch"))?
+                            .as_millis()
+                    ));
+                    std::fs::create_dir_all(&spool_root)?;
+                    let tasks: Vec<(usize, PathBuf, String, u64)> = files
+                        .iter()
+                        .enumerate()
+                        .map(|(index, file)| {
+                            let rel = file
+                                .strip_prefix(input_dir)
+                                .map_err(|_| CoZipError::InvalidZip("failed to compute relative path"))?;
+                            let entry_name = zip_name_from_relative_path(rel)?;
+                            let file_len = std::fs::metadata(file)?.len();
+                            Ok((index, file.clone(), entry_name, file_len))
+                        })
+                        .collect::<Result<_, CoZipError>>()?;
+                    let concurrency = match &self.backend {
+                        CoZipBackend::Zip {
+                            parallel_read_threads,
+                            ..
+                        } => (*parallel_read_threads).max(1),
+                        _ => 1,
+                    };
+                    let per_task_backlog =
+                        (2_u64 * 1024 * 1024 * 1024 / concurrency as u64).max(4 * 1024 * 1024);
+                    let shared_queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
+                    let (result_tx, result_rx) = std::sync::mpsc::channel();
+                    thread::scope(|scope| {
+                        for worker_id in 0..concurrency {
+                            let queue_ref = Arc::clone(&shared_queue);
+                            let tx_ref = result_tx.clone();
+                            let progress_ref = progress.clone();
+                            let deflate_ref = deflate.clone();
+                            let spool_path = spool_root.join(format!("worker-{worker_id:02}.bin"));
+                            scope.spawn(move || loop {
+                                let task = {
+                                    let mut queue = match queue_ref.lock() {
+                                        Ok(queue) => queue,
+                                        Err(_) => return,
+                                    };
+                                    queue.pop_front()
                                 };
-                                queue.pop_front()
-                            };
-                            let Some((index, file_path, entry_name, file_len)) = task else {
-                                return;
-                            };
-                            let result: Result<ZipPreparedEntry, CoZipError> = (|| {
-                                let spool_file = OpenOptions::new()
-                                    .create(true)
-                                    .read(true)
-                                    .append(true)
-                                    .open(&spool_path)?;
-                                let mut spool_writer = BufWriter::new(spool_file);
-                                let spool_offset = spool_writer.get_ref().metadata()?.len();
-                                if let Some(progress) = &progress_ref {
-                                    progress.begin_entry(entry_name.clone(), Some(file_len));
-                                }
-                                let read_reporter = progress_ref.clone().map(|progress| {
-                                    Arc::new(move |bytes| {
-                                        progress.advance_bytes(bytes);
-                                    }) as cozip_util::ReadReporter
-                                });
-                                let mut compressed = OffsetTrackingWriter::new(&mut spool_writer);
-                                let compress = deflate_ref
-                                    .deflate_compress_file_zip_compatible_with_index_parallel_read(
-                                        StdFile::open(&file_path)?,
-                                        &mut compressed,
-                                        cozip_util::ParallelFileReaderOptions {
-                                            worker_threads: 1,
-                                            max_inflight_ops: 0,
-                                            max_backlog_bytes: usize::try_from(per_task_backlog)
-                                                .unwrap_or(usize::MAX),
-                                            backlog_reporter: None,
-                                            read_reporter,
-                                        },
-                                    )?;
-                                spool_writer.flush()?;
-                                if let Some(progress) = &progress_ref {
-                                    progress.finish_entry();
-                                }
-                                Ok(ZipPreparedEntry {
-                                    name: entry_name,
-                                    crc: compress.stats.input_crc32,
-                                    compressed_size: compress.stats.output_bytes,
-                                    uncompressed_size: compress.stats.input_bytes,
-                                    czdi_blob: compress
-                                        .index
-                                        .map(|index| index.encode_czdi_v1())
-                                        .transpose()?,
-                                    spool_path: spool_path.clone(),
-                                    spool_offset,
-                                })
-                            })();
-                            let _ = tx_ref.send((index, result));
-                        });
+                                let Some((index, file_path, entry_name, file_len)) = task else {
+                                    return;
+                                };
+                                let result: Result<ZipPreparedEntry, CoZipError> = (|| {
+                                    let spool_file = OpenOptions::new()
+                                        .create(true)
+                                        .read(true)
+                                        .append(true)
+                                        .open(&spool_path)?;
+                                    let mut spool_writer = BufWriter::new(spool_file);
+                                    let spool_offset = spool_writer.get_ref().metadata()?.len();
+                                    if let Some(progress) = &progress_ref {
+                                        progress.begin_entry(entry_name.clone(), Some(file_len));
+                                    }
+                                    let read_reporter = progress_ref.clone().map(|progress| {
+                                        Arc::new(move |bytes| {
+                                            progress.advance_bytes(bytes);
+                                        }) as cozip_util::ReadReporter
+                                    });
+                                    let mut compressed = OffsetTrackingWriter::new(&mut spool_writer);
+                                    let compress = deflate_ref
+                                        .deflate_compress_file_zip_compatible_with_index_parallel_read(
+                                            StdFile::open(&file_path)?,
+                                            &mut compressed,
+                                            cozip_util::ParallelFileReaderOptions {
+                                                worker_threads: 1,
+                                                max_inflight_ops: 0,
+                                                max_backlog_bytes: usize::try_from(per_task_backlog)
+                                                    .unwrap_or(usize::MAX),
+                                                backlog_reporter: None,
+                                                read_reporter,
+                                            },
+                                        )?;
+                                    spool_writer.flush()?;
+                                    if let Some(progress) = &progress_ref {
+                                        progress.finish_entry();
+                                    }
+                                    let prepared = ZipPreparedEntry {
+                                        name: entry_name,
+                                        crc: compress.stats.input_crc32,
+                                        compressed_size: compress.stats.output_bytes,
+                                        uncompressed_size: compress.stats.input_bytes,
+                                        czdi_blob: compress
+                                            .index
+                                            .map(|index| index.encode_czdi_v1())
+                                            .transpose()?,
+                                        spool_path: spool_path.clone(),
+                                        spool_offset,
+                                    };
+                                    if zip_dir_verify_trace_enabled() {
+                                        zip_dir_verify_trace_log(format!(
+                                            "[zip_dir_verify] prepared_begin index={} path={} name={} spool_path={} spool_offset={} compressed_size={} uncompressed_size={} crc={:#010x}",
+                                            index,
+                                            file_path.display(),
+                                            prepared.name,
+                                            prepared.spool_path.display(),
+                                            prepared.spool_offset,
+                                            prepared.compressed_size,
+                                            prepared.uncompressed_size,
+                                            prepared.crc
+                                        ));
+                                        verify_prepared_entry_from_spool(&prepared, spool_writer.get_ref())?;
+                                        zip_dir_verify_trace_log(format!(
+                                            "[zip_dir_verify] prepared_ok index={} name={}",
+                                            index,
+                                            prepared.name
+                                        ));
+                                    }
+                                    Ok(prepared)
+                                })();
+                                let _ = tx_ref.send((index, result));
+                            });
+                        }
+                    });
+                    drop(result_tx);
+                    let mut pending = BTreeMap::<usize, Result<ZipPreparedEntry, CoZipError>>::new();
+                    let mut next_index = 0usize;
+                    let mut spool_cache = BTreeMap::<PathBuf, StdFile>::new();
+                    for _ in 0..files.len() {
+                        let (index, result) = result_rx
+                            .recv()
+                            .map_err(|_| CoZipError::InvalidZip("zip directory worker channel closed"))?;
+                        pending.insert(index, result);
+                        while let Some(result) = pending.remove(&next_index) {
+                            let prepared = result?;
+                            if zip_dir_verify_trace_enabled() {
+                                zip_dir_verify_trace_log(format!(
+                                    "[zip_dir_verify] zip_write_begin index={} name={} spool_path={} spool_offset={} compressed_size={} uncompressed_size={} crc={:#010x}",
+                                    next_index,
+                                    prepared.name,
+                                    prepared.spool_path.display(),
+                                    prepared.spool_offset,
+                                    prepared.compressed_size,
+                                    prepared.uncompressed_size,
+                                    prepared.crc
+                                ));
+                            }
+                            state.write_precompressed_entry(&mut writer, &mut spool_cache, &prepared)?;
+                            if zip_dir_verify_trace_enabled() {
+                                zip_dir_verify_trace_log(format!(
+                                    "[zip_dir_verify] zip_write_ok index={} name={}",
+                                    next_index,
+                                    prepared.name
+                                ));
+                            }
+                            next_index = next_index.saturating_add(1);
+                        }
                     }
-                });
-                drop(result_tx);
-                let mut pending = BTreeMap::<usize, Result<ZipPreparedEntry, CoZipError>>::new();
-                let mut next_index = 0usize;
-                let mut spool_cache = BTreeMap::<PathBuf, StdFile>::new();
-                for _ in 0..files.len() {
-                    let (index, result) = result_rx
-                        .recv()
-                        .map_err(|_| CoZipError::InvalidZip("zip directory worker channel closed"))?;
-                    pending.insert(index, result);
-                    while let Some(result) = pending.remove(&next_index) {
-                        let prepared = result?;
-                        state.write_precompressed_entry(&mut writer, &mut spool_cache, &prepared)?;
-                        next_index = next_index.saturating_add(1);
-                    }
-                }
-                let _ = std::fs::remove_dir_all(&spool_root);
+                    let _ = std::fs::remove_dir_all(&spool_root);
 
-                let stats = state.finish(&mut writer)?;
-                writer.flush()?;
-                if let Some(progress) = &progress {
-                    progress.finish();
+                    let stats = state.finish(&mut writer)?;
+                    writer.flush()?;
+                    if zip_dir_verify_trace_enabled() {
+                        drop(writer);
+                        verify_written_zip_archive(output_path.as_ref(), deflate)?;
+                    }
+                    if let Some(progress) = &progress {
+                        progress.finish();
+                    }
+                    Ok(stats)
+                })();
+                if zip_dir_verify_trace_enabled() {
+                    match &result {
+                        Ok(_) => zip_dir_verify_trace_finish_success(),
+                        Err(err) => zip_dir_verify_trace_flush_on_failure(err),
+                    }
                 }
-                Ok(stats)
+                result
             }
             CoZipBackend::PDeflate { pdeflate, .. } => {
                 let entries = collect_pdeflate_archive_entries_recursively(input_dir)?;
@@ -2755,7 +2818,6 @@ impl ZipWriteState {
         let name_bytes = prepared.name.as_bytes();
         let name_len = u16::try_from(name_bytes.len()).map_err(|_| CoZipError::DataTooLarge)?;
         let local_header_offset = self.offset;
-        let zip64_extra_len: u16 = 20;
         let gp_flags = GP_FLAG_DATA_DESCRIPTOR | GP_FLAG_UTF8;
 
         write_u32(writer, LOCAL_FILE_HEADER_SIG)?;
@@ -2765,20 +2827,15 @@ impl ZipWriteState {
         write_u16(writer, 0)?;
         write_u16(writer, 0)?;
         write_u32(writer, 0)?;
-        write_u32(writer, 0xFFFF_FFFF)?;
-        write_u32(writer, 0xFFFF_FFFF)?;
+        write_u32(writer, 0)?;
+        write_u32(writer, 0)?;
         write_u16(writer, name_len)?;
-        write_u16(writer, zip64_extra_len)?;
+        write_u16(writer, 0)?;
         writer.write_all(name_bytes)?;
-        write_u16(writer, ZIP64_EXTRA_FIELD_TAG)?;
-        write_u16(writer, 16)?;
-        write_u64(writer, 0)?;
-        write_u64(writer, 0)?;
 
         self.offset = self
             .offset
             .checked_add(30)
-            .and_then(|v| v.checked_add(u64::from(zip64_extra_len)))
             .and_then(|v| v.checked_add(u64::try_from(name_bytes.len()).ok()?))
             .ok_or(CoZipError::DataTooLarge)?;
 
@@ -2848,7 +2905,6 @@ impl ZipWriteState {
         let name_len = u16::try_from(name_bytes.len()).map_err(|_| CoZipError::DataTooLarge)?;
 
         let local_header_offset = self.offset;
-        let zip64_extra_len: u16 = 20;
         let gp_flags = GP_FLAG_DATA_DESCRIPTOR | GP_FLAG_UTF8;
 
         write_u32(writer, LOCAL_FILE_HEADER_SIG)?;
@@ -2858,21 +2914,15 @@ impl ZipWriteState {
         write_u16(writer, 0)?;
         write_u16(writer, 0)?;
         write_u32(writer, 0)?;
-        write_u32(writer, 0xFFFF_FFFF)?;
-        write_u32(writer, 0xFFFF_FFFF)?;
+        write_u32(writer, 0)?;
+        write_u32(writer, 0)?;
         write_u16(writer, name_len)?;
-        write_u16(writer, zip64_extra_len)?;
+        write_u16(writer, 0)?;
         writer.write_all(name_bytes)?;
-
-        write_u16(writer, ZIP64_EXTRA_FIELD_TAG)?;
-        write_u16(writer, 16)?;
-        write_u64(writer, 0)?;
-        write_u64(writer, 0)?;
 
         self.offset = self
             .offset
             .checked_add(30)
-            .and_then(|v| v.checked_add(u64::from(zip64_extra_len)))
             .and_then(|v| v.checked_add(u64::try_from(name_bytes.len()).ok()?))
             .ok_or(CoZipError::DataTooLarge)?;
 
@@ -2933,9 +2983,6 @@ impl ZipWriteState {
 
         let local_header_offset = self.offset;
 
-        // ZIP64 Extra Field in LFH: tag(2) + size(2) + uncompressed(8) + compressed(8) = 20
-        let zip64_extra_len: u16 = 20;
-
         let gp_flags = GP_FLAG_DATA_DESCRIPTOR | GP_FLAG_UTF8;
         write_u32(writer, LOCAL_FILE_HEADER_SIG)?;
         write_u16(writer, ZIP_VERSION_ZIP64)?;
@@ -2944,22 +2991,15 @@ impl ZipWriteState {
         write_u16(writer, 0)?; // mod time
         write_u16(writer, 0)?; // mod date
         write_u32(writer, 0)?; // crc (unknown, data descriptor)
-        write_u32(writer, 0xFFFF_FFFF)?; // compressed size (ZIP64)
-        write_u32(writer, 0xFFFF_FFFF)?; // uncompressed size (ZIP64)
+        write_u32(writer, 0)?; // compressed size (unknown, data descriptor)
+        write_u32(writer, 0)?; // uncompressed size (unknown, data descriptor)
         write_u16(writer, name_len)?;
-        write_u16(writer, zip64_extra_len)?;
+        write_u16(writer, 0)?;
         writer.write_all(name_bytes)?;
-
-        // ZIP64 extra field (placeholder — sizes unknown before compression)
-        write_u16(writer, ZIP64_EXTRA_FIELD_TAG)?;
-        write_u16(writer, 16)?; // data size: uncompressed(8) + compressed(8)
-        write_u64(writer, 0)?; // uncompressed placeholder
-        write_u64(writer, 0)?; // compressed placeholder
 
         self.offset = self
             .offset
             .checked_add(30)
-            .and_then(|v| v.checked_add(u64::from(zip64_extra_len)))
             .and_then(|v| v.checked_add(u64::try_from(name_bytes.len()).ok()?))
             .ok_or(CoZipError::DataTooLarge)?;
 
@@ -3162,6 +3202,160 @@ fn read_at_file(file: &StdFile, offset: u64, buf: &mut [u8]) -> io::Result<usize
         clone.seek(SeekFrom::Start(offset))?;
         clone.read(buf)
     }
+}
+
+fn zip_dir_verify_trace_enabled() -> bool {
+    env::var_os(ZIP_DIR_VERIFY_TRACE_ENV).is_some()
+}
+
+fn zip_dir_verify_trace_path() -> PathBuf {
+    std::env::temp_dir().join("cozip-zip-dir-verify.log")
+}
+
+fn zip_dir_verify_trace_reset() {
+    if let Ok(mut lines) = ZIP_DIR_VERIFY_TRACE_LINES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+    {
+        lines.clear();
+    }
+    let _ = std::fs::remove_file(zip_dir_verify_trace_path());
+}
+
+fn zip_dir_verify_trace_log(message: impl AsRef<str>) {
+    if !zip_dir_verify_trace_enabled() {
+        return;
+    }
+    let Ok(mut lines) = ZIP_DIR_VERIFY_TRACE_LINES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+    else {
+        return;
+    };
+    lines.push(message.as_ref().to_string());
+}
+
+fn zip_dir_verify_trace_flush_on_failure(error: &CoZipError) {
+    if !zip_dir_verify_trace_enabled() {
+        return;
+    }
+    let path = zip_dir_verify_trace_path();
+    let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let _ = writeln!(file, "[zip_dir_verify] failure error={error}");
+    let _ = writeln!(file, "[zip_dir_verify] trace_path={}", path.display());
+    if let Ok(lines) = ZIP_DIR_VERIFY_TRACE_LINES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+    {
+        for line in lines.iter() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+    let _ = file.flush();
+}
+
+fn zip_dir_verify_trace_finish_success() {
+    if !zip_dir_verify_trace_enabled() {
+        return;
+    }
+    if let Ok(mut lines) = ZIP_DIR_VERIFY_TRACE_LINES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+    {
+        lines.clear();
+    }
+    let _ = std::fs::remove_file(zip_dir_verify_trace_path());
+}
+
+struct FileSegmentReader<'a> {
+    file: &'a StdFile,
+    offset: u64,
+    remaining: u64,
+}
+
+impl<'a> FileSegmentReader<'a> {
+    fn new(file: &'a StdFile, offset: u64, remaining: u64) -> Self {
+        Self {
+            file,
+            offset,
+            remaining,
+        }
+    }
+}
+
+impl Read for FileSegmentReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.remaining == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let read_len = usize::try_from(self.remaining.min(buf.len() as u64)).unwrap_or(buf.len());
+        let read = read_at_file(self.file, self.offset, &mut buf[..read_len])?;
+        let delta = u64::try_from(read).unwrap_or(u64::MAX);
+        self.offset = self.offset.saturating_add(delta);
+        self.remaining = self.remaining.saturating_sub(delta);
+        Ok(read)
+    }
+}
+
+fn verify_prepared_entry_from_spool(
+    prepared: &ZipPreparedEntry,
+    spool_file: &StdFile,
+) -> Result<(), CoZipError> {
+    let mut reader =
+        FileSegmentReader::new(spool_file, prepared.spool_offset, prepared.compressed_size);
+    let mut sink = io::sink();
+    let stats = deflate_decompress_stream_on_cpu(&mut reader, &mut sink)?;
+    if stats.input_bytes != prepared.compressed_size {
+        return Err(CoZipError::InvalidZip(
+            "prepared entry compressed size mismatch during verification",
+        ));
+    }
+    if stats.output_bytes != prepared.uncompressed_size {
+        return Err(CoZipError::InvalidZip(
+            "prepared entry uncompressed size mismatch during verification",
+        ));
+    }
+    if stats.output_crc32 != prepared.crc {
+        return Err(CoZipError::InvalidZip(
+            "prepared entry crc32 mismatch during verification",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_written_zip_archive(output_path: &Path, deflate: &CoZipDeflate) -> Result<(), CoZipError> {
+    let output = StdFile::open(output_path)?;
+    let mut reader = BufReader::new(output);
+    let (entries, _) = read_central_directory_entries(&mut reader)?;
+    zip_dir_verify_trace_log(format!(
+        "[zip_dir_verify] final_zip_begin path={} entries={}",
+        output_path.display(),
+        entries.len()
+    ));
+    for entry in &entries {
+        zip_dir_verify_trace_log(format!(
+            "[zip_dir_verify] final_zip_entry_begin name={} compressed_size={} uncompressed_size={} crc={:#010x}",
+            entry.name, entry.compressed_size, entry.uncompressed_size, entry.crc
+        ));
+        let mut sink = io::sink();
+        extract_entry_to_writer(&mut reader, entry, &mut sink, deflate)?;
+        zip_dir_verify_trace_log(format!(
+            "[zip_dir_verify] final_zip_entry_ok name={}",
+            entry.name
+        ));
+    }
+    zip_dir_verify_trace_log(format!(
+        "[zip_dir_verify] final_zip_ok path={}",
+        output_path.display()
+    ));
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -5108,6 +5302,54 @@ mod tests {
             std::fs::read(restore_dir.join("nested").join("b.txt")).expect("read restored b"),
             b"bbb"
         );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cozip_directory_roundtrip_many_files_self_verify() {
+        let cozip = CoZip::init(CoZipOptions::Zip {
+            options: ZipOptions {
+                parallel_read_threads: 4,
+                ..ZipOptions::default()
+            },
+        })
+        .expect("init");
+        let base =
+            std::env::temp_dir().join(format!("cozip-dir-many-{}", std::process::id()));
+        let input_dir = base.join("input");
+        let output_zip = base.join("archive.zip");
+        let restore_dir = base.join("restored");
+
+        std::fs::create_dir_all(&input_dir).expect("create input dir");
+        for index in 0..48usize {
+            let file_path = input_dir.join(format!("file-{index:03}.bin"));
+            let len = 256 * 1024 + (index * 8192);
+            let mut data = vec![0_u8; len];
+            for (offset, byte) in data.iter_mut().enumerate() {
+                *byte = ((index * 31 + offset) % 251) as u8;
+            }
+            std::fs::write(&file_path, &data).expect("write input file");
+        }
+
+        cozip
+            .compress_directory(&input_dir, &output_zip)
+            .expect("compress directory");
+        let CoZipBackend::Zip { deflate, .. } = &cozip.backend else {
+            panic!("expected zip backend");
+        };
+        verify_written_zip_archive(&output_zip, deflate).expect("verify written zip");
+
+        cozip
+            .decompress_directory_from_name(&output_zip, &restore_dir)
+            .expect("decompress directory");
+
+        for index in [0usize, 7, 19, 31, 47] {
+            let name = format!("file-{index:03}.bin");
+            let original = std::fs::read(input_dir.join(&name)).expect("read original");
+            let restored = std::fs::read(restore_dir.join(&name)).expect("read restored");
+            assert_eq!(restored, original, "restored bytes should match for {name}");
+        }
 
         let _ = std::fs::remove_dir_all(base);
     }
