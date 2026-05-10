@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+Name=CoZip 20 Extract With Options
+Name[ja]=CoZip 20 詳細設定
+MimeType=application/zip;application/x-cozip;application/x-zip-compressed;application/x-zip;
+Actions=cozip-20-extract-details;
+X-KDE-Submenu=Extract
+X-KDE-Submenu[ja]=展開
+X-KDE-Protocols=file
+X-KDE-MinNumberOfUrls=1
+
+[Desktop Action cozip-20-extract-details]
+Name=詳細設定
+Name[en]=Advanced
+Icon=@COZIP_DECOMP_ICON@
+Exec=@COZIP_DESKTOP@ ui extract-details %F

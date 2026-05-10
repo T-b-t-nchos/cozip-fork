@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+Name=CoZip 10 ZIP Compress
+Name[ja]=CoZip 10 ZIP 圧縮
+MimeType=application/octet-stream;inode/directory;
+Actions=cozip-10-compress-zip;
+X-KDE-Submenu=Compress
+X-KDE-Submenu[ja]=圧縮
+X-KDE-Protocols=file
+X-KDE-MinNumberOfUrls=1
+
+[Desktop Action cozip-10-compress-zip]
+Name=ZIP に圧縮
+Name[en]=Compress to ZIP
+Icon=@COZIP_COMP_ICON@
+Exec=@COZIP_DESKTOP@ compress --format zip %F

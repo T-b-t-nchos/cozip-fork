@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Service
+Name=CoZip 10 Extract Here
+Name[ja]=CoZip 10 ここに展開
+MimeType=application/zip;application/x-cozip;application/x-zip-compressed;application/x-zip;
+Actions=cozip-10-extract-here;
+X-KDE-Submenu=Extract
+X-KDE-Submenu[ja]=展開
+X-KDE-Protocols=file
+X-KDE-MinNumberOfUrls=1
+
+[Desktop Action cozip-10-extract-here]
+Name=ここに展開
+Name[en]=Extract Here
+Icon=@COZIP_DECOMP_ICON@
+Exec=@COZIP_DESKTOP@ extract --here %F
