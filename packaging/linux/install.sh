@@ -13,6 +13,18 @@ ICON_DIR="${DATA_DIR}/icons"
 COZIP_DESKTOP_BIN="${BIN_DIR}/cozip_desktop"
 COZIP_COMP_ICON="${ICON_DIR}/comp.ico"
 COZIP_DECOMP_ICON="${ICON_DIR}/decomp.ico"
+# GNOME (Nautilus) / Cinnamon (Nemo) / MATE (Caja) right-click "Scripts" support.
+COZIP_FM_COMMON="${DATA_DIR}/filemanager-common.sh"
+NAUTILUS_SCRIPT_DIR="${HOME}/.local/share/nautilus/scripts"
+NEMO_SCRIPT_DIR="${HOME}/.local/share/nemo/scripts"
+CAJA_SCRIPT_DIR="${HOME}/.config/caja/scripts"
+FM_SCRIPT_NAMES=(
+  "CoZip Compress to ZIP"
+  "CoZip Compress to CoZip"
+  "CoZip Compress (options)"
+  "CoZip Extract Here"
+  "CoZip Extract (options)"
+)
 
 build=1
 if [[ "${1:-}" == "--no-build" ]]; then
@@ -42,6 +54,30 @@ install_desktop_template() {
     -e "s|@COZIP_DECOMP_ICON@|${escaped_decomp_icon}|g" \
     "$src" > "$dst"
   chmod 0644 "$dst"
+}
+
+install_filemanager_common() {
+  local escaped_bin
+  escaped_bin="$(escape_sed_replacement "$COZIP_DESKTOP_BIN")"
+  mkdir -p "$(dirname "$COZIP_FM_COMMON")"
+  sed \
+    -e "s|@COZIP_DESKTOP@|${escaped_bin}|g" \
+    "$SCRIPT_DIR/filemanager-scripts/_cozip_common.sh" > "$COZIP_FM_COMMON"
+  chmod 0644 "$COZIP_FM_COMMON"
+}
+
+install_filemanager_scripts_into() {
+  local dst_dir="$1"
+  local escaped_common
+  escaped_common="$(escape_sed_replacement "$COZIP_FM_COMMON")"
+  mkdir -p "$dst_dir"
+  local name
+  for name in "${FM_SCRIPT_NAMES[@]}"; do
+    sed \
+      -e "s|@COZIP_FM_COMMON@|${escaped_common}|g" \
+      "$SCRIPT_DIR/filemanager-scripts/${name}" > "${dst_dir}/${name}"
+    chmod 0755 "${dst_dir}/${name}"
+  done
 }
 
 refresh_desktop_caches() {
@@ -91,9 +127,16 @@ chmod +x \
   "$SERVICEMENU_DIR/cozip-10-extract-here.desktop" \
   "$SERVICEMENU_DIR/cozip-20-extract-details.desktop"
 
+echo "==> Installing file-manager scripts (GNOME/Cinnamon/MATE)..."
+install_filemanager_common
+install_filemanager_scripts_into "$NAUTILUS_SCRIPT_DIR"
+install_filemanager_scripts_into "$NEMO_SCRIPT_DIR"
+install_filemanager_scripts_into "$CAJA_SCRIPT_DIR"
+
 echo "==> Refreshing desktop caches..."
 refresh_desktop_caches
 
 echo ""
 echo "Done! Installed $COZIP_DESKTOP_BIN."
 echo "You may need to restart Dolphin (or log out/in) for the service menus to appear."
+echo "On GNOME/Cinnamon/MATE the actions appear under the right-click \"Scripts\" submenu."

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{File as StdFile, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -5160,8 +5161,7 @@ fn zip_name_from_relative_path(path: &Path) -> Result<String, CoZipError> {
     for component in path.components() {
         match component {
             Component::Normal(part) => {
-                let part = part.to_str().ok_or(CoZipError::NonUtf8Name)?;
-                parts.push(part.to_string());
+                parts.push(zip_name_part_from_os_str(part)?);
             }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
@@ -5191,8 +5191,56 @@ fn file_name_from_path(path: &Path) -> Result<String, CoZipError> {
     let file_name = path
         .file_name()
         .ok_or(CoZipError::InvalidEntryName("file name is missing"))?;
-    let file_name = file_name.to_str().ok_or(CoZipError::NonUtf8Name)?;
-    normalize_zip_entry_name(file_name)
+    let file_name = zip_name_part_from_os_str(file_name)?;
+    normalize_zip_entry_name(&file_name)
+}
+
+fn zip_name_part_from_os_str(part: &OsStr) -> Result<String, CoZipError> {
+    if let Some(value) = part.to_str() {
+        return Ok(value.to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        return decode_unix_filename_bytes(part.as_bytes());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = part;
+        Err(CoZipError::NonUtf8Name)
+    }
+}
+
+#[cfg(unix)]
+fn decode_unix_filename_bytes(bytes: &[u8]) -> Result<String, CoZipError> {
+    if bytes.is_empty() {
+        return Err(CoZipError::InvalidEntryName("entry name is empty"));
+    }
+
+    let (shift_jis_decoded, _, shift_jis_had_errors) = SHIFT_JIS.decode(bytes);
+    if !shift_jis_had_errors {
+        let candidate = shift_jis_decoded.into_owned();
+        let (reencoded, _, reencode_had_errors) = SHIFT_JIS.encode(&candidate);
+        if !reencode_had_errors
+            && reencoded.as_ref() == bytes
+            && contains_probably_japanese_text(&candidate)
+        {
+            inspect_trace_log(format!(
+                "[path_name] decode_unix_filename encoding=shift_jis value={}",
+                candidate
+            ));
+            return Ok(candidate);
+        }
+    }
+
+    let candidate = String::from_utf8_lossy(bytes).into_owned();
+    inspect_trace_log(format!(
+        "[path_name] decode_unix_filename encoding=utf8_lossy value={}",
+        candidate
+    ));
+    Ok(candidate)
 }
 
 fn normalize_zip_entry_name(name: &str) -> Result<String, CoZipError> {
@@ -5508,6 +5556,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shift_jis_unix_filename_bytes_become_utf8_zip_name() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let file_name = OsString::from_vec(vec![
+            0x83, 0x65, 0x83, 0x58, 0x83, 0x67, b'.', b't', b'x', b't',
+        ]);
+        let path = PathBuf::from(file_name);
+
+        assert_eq!(
+            file_name_from_path(&path).expect("decode shift jis path"),
+            "テスト.txt"
+        );
     }
 
     #[test]

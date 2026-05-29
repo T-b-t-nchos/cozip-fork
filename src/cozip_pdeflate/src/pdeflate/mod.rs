@@ -239,7 +239,7 @@ impl Default for PDeflateOptions {
             gpu_tail_stop_ratio: 1.0,
             parallel_read_threads: parallel_threads,
             parallel_write_threads: parallel_threads,
-            huffman_encode_enabled: false,
+            huffman_encode_enabled: true,
             compression_mode: PDeflateCompressionMode::Speed,
             hybrid_scheduler_policy: PDeflateHybridSchedulerPolicy::GlobalQueue,
         }
@@ -2256,38 +2256,124 @@ fn finalize_chunk_from_table(
             let mut scratch = scratch.borrow_mut();
             scratch.section_index.clear();
             scratch.section_bitstream.clear();
-            let huffman_enabled = options.huffman_encode_enabled;
-            let mut section_cmd_cursor = 0usize;
-            for &len_u32 in &section_cmd_lens {
-                let sec_cmd_len =
-                    usize::try_from(len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
-                let sec_cmd_end = section_cmd_cursor
-                    .checked_add(sec_cmd_len)
-                    .ok_or(PDeflateError::NumericOverflow)?;
-                let sec_cmd = section_cmd.get(section_cmd_cursor..sec_cmd_end).ok_or(
-                    PDeflateError::InvalidStream(
-                        "section command range out of bounds during bitstream encode",
-                    ),
-                )?;
-                let bit_len = if huffman_enabled {
-                    let symbols = logical_commands_to_huffman_symbols(sec_cmd);
-                    encode_huffman_symbols_to_bitstream(symbols, &mut scratch.section_bitstream)?
-                } else {
-                    scratch.section_bitstream.extend_from_slice(sec_cmd);
-                    u32::try_from(
+            // Always lay out the plain (non-entropy-coded) section index so the chunk
+            // can fall back to it when Huffman would not pay off.
+            let mut plain_index = Vec::with_capacity(section_count);
+            {
+                let mut cursor = 0usize;
+                for &len_u32 in &section_cmd_lens {
+                    let sec_cmd_len =
+                        usize::try_from(len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+                    let plain_bit_len = u32::try_from(
                         sec_cmd_len
                             .checked_mul(8)
                             .ok_or(PDeflateError::NumericOverflow)?,
                     )
-                    .map_err(|_| PDeflateError::NumericOverflow)?
-                };
-                write_varint_u32(&mut scratch.section_index, bit_len);
-                section_cmd_cursor = sec_cmd_end;
+                    .map_err(|_| PDeflateError::NumericOverflow)?;
+                    write_varint_u32(&mut plain_index, plain_bit_len);
+                    cursor = cursor
+                        .checked_add(sec_cmd_len)
+                        .ok_or(PDeflateError::NumericOverflow)?;
+                }
+                if cursor != section_cmd.len() {
+                    return Err(PDeflateError::InvalidStream(
+                        "sum(section command len) != section command stream size",
+                    ));
+                }
             }
-            if section_cmd_cursor != section_cmd.len() {
-                return Err(PDeflateError::InvalidStream(
-                    "sum(section command len) != section command stream size",
-                ));
+
+            // Build one canonical Huffman codebook for the whole chunk from the
+            // frequency distribution of the section command stream. This entropy
+            // stage runs on the CPU after GPU/CPU match-finding, so it improves the
+            // ratio without disturbing the GPU-accelerated match path. The codebook
+            // is skipped for empty chunks (no symbols) so they keep the plain layout.
+            let huffman_attempt = if options.huffman_encode_enabled && !section_cmd.is_empty() {
+                let mut frequencies = [0u32; 256];
+                for &symbol in section_cmd.iter() {
+                    let slot = &mut frequencies[symbol as usize];
+                    *slot = slot.saturating_add(1);
+                }
+                // On the (provably unreachable for a 256-symbol alphabet at 15 bits)
+                // chance the codebook is rejected, fall back to the plain layout.
+                build_canonical_huffman_codebook_from_frequencies(&frequencies, HUFF_MAX_CODE_BITS)
+                    .ok()
+                    .map(|codebook| (frequencies, codebook))
+            } else {
+                None
+            };
+
+            // Decide per chunk whether to spend the (slower) entropy pass. The estimate
+            // from the codebook is cheap; the actual section encoding is not, so it is
+            // only performed when the codebook predicts a worthwhile saving. The flag is
+            // per-chunk, so mixing Huffman and plain chunks stays backward compatible.
+            let plain_bytes = section_cmd.len() + plain_index.len();
+            let huff_lut_storage = if let Some((frequencies, codebook)) = huffman_attempt.as_ref() {
+                let root_bits = HUFF_LUT_ROOT_BITS_DEFAULT
+                    .min(codebook.max_code_bits)
+                    .max(1);
+                let lut = build_huffman_lut(codebook, root_bits)?;
+                let serialized_lut = serialize_huffman_lut(&lut)?;
+
+                let estimated_payload_bits: u64 = (0..256)
+                    .filter_map(|symbol| {
+                        codebook.codes[symbol]
+                            .map(|code| u64::from(frequencies[symbol]) * u64::from(code.bit_len))
+                    })
+                    .sum();
+                let estimated_huff_bytes = (estimated_payload_bits / 8)
+                    .saturating_add(serialized_lut.len() as u64)
+                    .saturating_add(plain_index.len() as u64);
+                // Require a clear win (>= ~10%) before paying the entropy/encode cost, so
+                // incompressible or marginally-compressible chunks keep the fast path.
+                let worth_encoding = estimated_huff_bytes.saturating_mul(20)
+                    < (plain_bytes as u64).saturating_mul(19);
+
+                if worth_encoding {
+                    let mut huff_bitstream = Vec::with_capacity(section_cmd.len());
+                    let mut huff_index = Vec::with_capacity(section_count);
+                    let mut cursor = 0usize;
+                    for &len_u32 in &section_cmd_lens {
+                        let sec_cmd_len =
+                            usize::try_from(len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
+                        let sec_cmd_end = cursor
+                            .checked_add(sec_cmd_len)
+                            .ok_or(PDeflateError::NumericOverflow)?;
+                        let sec_cmd = section_cmd.get(cursor..sec_cmd_end).ok_or(
+                            PDeflateError::InvalidStream(
+                                "section command range out of bounds during bitstream encode",
+                            ),
+                        )?;
+                        let (encoded, sec_bit_len) =
+                            encode_symbols_with_huffman_codebook(sec_cmd, codebook)?;
+                        huff_bitstream.extend_from_slice(&encoded);
+                        write_varint_u32(
+                            &mut huff_index,
+                            u32::try_from(sec_bit_len)
+                                .map_err(|_| PDeflateError::NumericOverflow)?,
+                        );
+                        cursor = sec_cmd_end;
+                    }
+
+                    // The exact comparison guarantees the chunk never grows.
+                    let huff_cost = huff_bitstream.len() + huff_index.len() + serialized_lut.len();
+                    if huff_cost < plain_bytes {
+                        scratch.section_bitstream.extend_from_slice(&huff_bitstream);
+                        scratch.section_index.extend_from_slice(&huff_index);
+                        Some(serialized_lut)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let huffman_enabled = huff_lut_storage.is_some();
+            if !huffman_enabled {
+                scratch.section_bitstream.extend_from_slice(&section_cmd);
+                scratch.section_index.extend_from_slice(&plain_index);
             }
 
             let (table_index, table_data): (&[u8], &[u8]) = if let (Some(idx), Some(data)) =
@@ -2307,11 +2393,6 @@ fn finalize_chunk_from_table(
                     scratch.table_data.extend_from_slice(entry);
                 }
                 (&scratch.table_index, &scratch.table_data)
-            };
-            let huff_lut_storage = if huffman_enabled {
-                Some(build_identity_huffman_lut_block()?)
-            } else {
-                None
             };
             let huff_lut = huff_lut_storage.as_deref().unwrap_or(&[]);
             let chunk_flags = if huffman_enabled {
@@ -4375,7 +4456,13 @@ fn preprocess_chunk_for_gpu_decode(payload: &[u8]) -> Result<ChunkDecodePreproce
         let sec_bit_len_u32 = read_varint_u32(section_index, &mut section_idx_cursor)?;
         let sec_bit_len =
             usize::try_from(sec_bit_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
-        let sec_cmd_len = section_bit_len_to_byte_len(sec_bit_len)?;
+        // Huffman sections are byte-aligned in storage with an exact bit length, so
+        // the stored byte count is ceil(bits/8); plain sections stay byte-aligned.
+        let sec_cmd_len = if huffman_enabled {
+            sec_bit_len.div_ceil(8)
+        } else {
+            section_bit_len_to_byte_len(sec_bit_len)?
+        };
         let sec_cmd_end = cmd_cursor
             .checked_add(sec_cmd_len)
             .ok_or(PDeflateError::NumericOverflow)?;
@@ -4539,7 +4626,13 @@ fn decompress_chunk_into(payload: &[u8], out: &mut [u8]) -> Result<ChunkDecoded,
             let sec_bit_len_u32 = read_varint_u32(section_index, &mut section_idx_cursor)?;
             let sec_bit_len =
                 usize::try_from(sec_bit_len_u32).map_err(|_| PDeflateError::NumericOverflow)?;
-            let sec_cmd_len = section_bit_len_to_byte_len(sec_bit_len)?;
+            // Huffman sections are byte-aligned in storage but carry an exact (possibly
+            // non-byte-aligned) bit length, so the stored byte count is ceil(bits/8).
+            let sec_cmd_len = if huffman_enabled {
+                sec_bit_len.div_ceil(8)
+            } else {
+                section_bit_len_to_byte_len(sec_bit_len)?
+            };
             let sec_cmd_end = cmd_cursor
                 .checked_add(sec_cmd_len)
                 .ok_or(PDeflateError::NumericOverflow)?;
@@ -6149,14 +6242,72 @@ fn build_huffman_code_lengths_from_frequencies(
         if depth == 0 {
             depth = 1;
         }
-        if depth > usize::from(max_code_bits) {
-            return Err(PDeflateError::InvalidOptions(
-                "huffman code length exceeds max_code_bits",
-            ));
-        }
-        lengths[symbol] = u8::try_from(depth).map_err(|_| PDeflateError::NumericOverflow)?;
+        // Plain Huffman over a 256-symbol alphabet can exceed the format's code-length
+        // limit on strongly skewed data. Store the (bounded) depth here and let
+        // limit_code_lengths cap it below without rejecting the input.
+        lengths[symbol] = u8::try_from(depth.min(255)).unwrap_or(255);
     }
+    limit_code_lengths(&mut lengths, frequencies, max_code_bits);
     Ok(lengths)
+}
+
+/// Caps Huffman code lengths to `max_code_bits` while keeping a valid (not
+/// oversubscribed) prefix code.
+///
+/// Over-long codes are clamped to the limit, which oversubscribes the Kraft sum;
+/// the surplus is then repaired on the length histogram using zlib's `gen_bitlen`
+/// redistribution, after which lengths are reassigned so the least frequent symbols
+/// receive the longest codes. The result is at most a hair from optimal and always
+/// satisfies the canonical-code constraints.
+fn limit_code_lengths(lengths: &mut [u8], frequencies: &[u32], max_code_bits: u8) {
+    let l = usize::from(max_code_bits);
+    if l == 0 {
+        return;
+    }
+
+    let mut overflow: i64 = 0;
+    let mut bl_count = vec![0i64; l + 1];
+    for &len in lengths.iter() {
+        let len = usize::from(len);
+        if len == 0 {
+            continue;
+        }
+        if len > l {
+            overflow += 1;
+            bl_count[l] += 1;
+        } else {
+            bl_count[len] += 1;
+        }
+    }
+    if overflow == 0 {
+        return;
+    }
+
+    while overflow > 0 {
+        let mut bits = l - 1;
+        while bits > 0 && bl_count[bits] == 0 {
+            bits -= 1;
+        }
+        if bits == 0 {
+            break;
+        }
+        bl_count[bits] -= 1;
+        bl_count[bits + 1] += 2;
+        bl_count[l] -= 1;
+        overflow -= 2;
+    }
+
+    let mut syms: Vec<usize> = (0..lengths.len()).filter(|&s| lengths[s] > 0).collect();
+    syms.sort_by_key(|&s| (frequencies[s], s));
+    let mut pos = 0usize;
+    for bits in (1..=l).rev() {
+        let mut count = bl_count[bits];
+        while count > 0 && pos < syms.len() {
+            lengths[syms[pos]] = bits as u8;
+            pos += 1;
+            count -= 1;
+        }
+    }
 }
 
 fn build_canonical_huffman_codebook_from_lengths(
@@ -6813,7 +6964,9 @@ fn decode_section_bitstream_to_huffman_symbols_with_lut(
     section_bit_len: usize,
     huff_lut: &HuffmanLut,
 ) -> Result<Vec<u8>, PDeflateError> {
-    let byte_len = section_bit_len_to_byte_len(section_bit_len)?;
+    // Huffman section bitstreams are byte-aligned in storage; the exact bit length
+    // may not be a multiple of 8, so the stored byte count is ceil(bits/8).
+    let byte_len = section_bit_len.div_ceil(8);
     if byte_len != section_bits.len() {
         return Err(PDeflateError::InvalidStream(
             "section bitstream length mismatch",
@@ -6990,6 +7143,24 @@ mod tests {
         for b in &mut out {
             x = x.wrapping_mul(1664525).wrapping_add(1013904223);
             *b = (x >> 24) as u8;
+        }
+        out
+    }
+
+    /// Literal-heavy data with a strongly skewed byte distribution that resists the
+    /// match finder, used so the per-chunk entropy stage clearly pays off and the
+    /// Huffman layout is selected. Symbols are squared (biased toward small values) and
+    /// folded into a moderate alphabet, then XORed with a position bit so identical
+    /// 3-grams rarely recur — leaving a skewed literal stream the match stage cannot
+    /// absorb, which Huffman compresses well (~15% on this generator).
+    fn skewed_literal_data(size: usize, seed: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(size);
+        let mut state = seed;
+        while out.len() < size {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let r = (state >> 24) as usize & 0xff;
+            let sym = ((r * r / 1024) as u8) & 0x3f;
+            out.push(sym ^ ((out.len() as u8) & 0x40));
         }
         out
     }
@@ -7199,9 +7370,23 @@ mod tests {
     }
 
     #[test]
-    fn chunk_contains_identity_huffman_lut_block() {
-        let input = b"ABABABABABABABAB".to_vec();
-        let payload = compress_single_chunk_payload_with_huffman(&input, 1, true);
+    fn chunk_contains_real_huffman_lut_block() {
+        // Skewed literal-heavy input must produce a real, frequency-optimised canonical
+        // Huffman chunk (strictly smaller than the plain layout, unlike the old identity
+        // placeholder) that still carries a valid LUT and round-trips.
+        let input = skewed_literal_data(512 * 1024, 0x51ce_d00d);
+        let payload = compress_single_chunk_payload_with_huffman(&input, 128, true);
+        let plain = compress_single_chunk_payload_with_huffman(&input, 128, false);
+
+        // Real entropy coding must beat the plain layout. The old identity placeholder
+        // could only match or inflate it.
+        assert!(
+            payload.len() < plain.len(),
+            "huffman chunk ({}) should be smaller than plain ({})",
+            payload.len(),
+            plain.len()
+        );
+
         let (
             table_index_offset,
             table_data_offset,
@@ -7219,25 +7404,21 @@ mod tests {
         assert!(!huff_lut.is_empty());
         let lut = deserialize_huffman_lut(huff_lut).expect("deserialize chunk lut");
         assert_eq!(lut.symbol_count, 256);
-        assert_eq!(lut.root_bits, 8);
-        assert_eq!(lut.max_code_bits, 8);
-        assert_eq!(lut.root.len(), 256);
-        assert!(lut.subtables.is_empty());
-        for (idx, entry) in lut.root.iter().copied().enumerate() {
-            match entry {
-                HuffmanLutEntry::Symbol { symbol, bit_len } => {
-                    assert_eq!(usize::from(symbol), idx);
-                    assert_eq!(bit_len, 8);
-                }
-                _ => panic!("identity lut root must contain direct symbols"),
-            }
-        }
+        assert!(lut.max_code_bits <= HUFF_MAX_CODE_BITS);
+        assert_eq!(
+            lut.root_bits,
+            HUFF_LUT_ROOT_BITS_DEFAULT.min(lut.max_code_bits).max(1)
+        );
+
+        // The chunk must still decode back to the original bytes.
+        let decoded = decode_chunk_payload_cpu(&payload);
+        assert_eq!(decoded, input);
     }
 
     #[test]
     fn reject_corrupted_chunk_huffman_lut_block() {
-        let input = b"ABABABABABABABAB".to_vec();
-        let mut payload = compress_single_chunk_payload_with_huffman(&input, 1, true);
+        let input = skewed_literal_data(512 * 1024, 0x51ce_d00d);
+        let mut payload = compress_single_chunk_payload_with_huffman(&input, 128, true);
         let (_table_index_offset, _table_data_offset, huff_lut_offset, _section_index_offset, _) =
             chunk_offsets(&payload);
         // huff lut header: [symbol_count:u16][root_bits:u8][max_code_bits:u8][root_len:u32]...
@@ -7473,6 +7654,57 @@ mod tests {
             gpu_decompress_enabled: true,
             gpu_decompress_force_gpu: true,
             ..PDeflateOptions::default()
+        };
+        let cpu_out = decompress_with_options(&compressed, &cpu_opts);
+        let gpu_out = decompress_with_options(&compressed, &gpu_opts);
+        assert_eq!(cpu_out, input);
+        assert_eq!(gpu_out, input);
+        assert_eq!(gpu_out, cpu_out);
+    }
+
+    #[test]
+    fn gpu_decode_v2_matches_cpu_with_huffman() {
+        // A Huffman-encoded stream must decode identically on the CPU and the GPU
+        // (the decode_v2 shader has a canonical-Huffman LUT decoder), and must also
+        // be smaller than the same stream without Huffman.
+        let _guard = gpu_test_lock();
+        if !gpu::is_runtime_available() {
+            return;
+        }
+        gpu::reset_decode_slot_pool_for_test().expect("reset decode slot pool");
+        let input = skewed_literal_data(512 * 1024, 0x0bad_f00d);
+
+        // Compress on the CPU so the Huffman-vs-plain size comparison is deterministic
+        // (GPU match-finding can vary run to run). The Huffman flag is per-chunk, so the
+        // result can never be larger than the plain layout.
+        let huffman_opts = PDeflateOptions {
+            gpu_compress_enabled: false,
+            huffman_encode_enabled: true,
+            ..PDeflateOptions::default()
+        };
+        let plain_opts = PDeflateOptions {
+            gpu_compress_enabled: false,
+            huffman_encode_enabled: false,
+            ..PDeflateOptions::default()
+        };
+        let compressed = pdeflate_compress(&input, &huffman_opts).expect("compress huffman");
+        let plain = pdeflate_compress(&input, &plain_opts).expect("compress plain");
+        assert!(
+            compressed.len() < plain.len(),
+            "huffman stream ({}) should be smaller than plain ({})",
+            compressed.len(),
+            plain.len()
+        );
+
+        let cpu_opts = PDeflateOptions {
+            gpu_decompress_enabled: false,
+            gpu_decompress_force_gpu: false,
+            ..huffman_opts.clone()
+        };
+        let gpu_opts = PDeflateOptions {
+            gpu_decompress_enabled: true,
+            gpu_decompress_force_gpu: true,
+            ..huffman_opts.clone()
         };
         let cpu_out = decompress_with_options(&compressed, &cpu_opts);
         let gpu_out = decompress_with_options(&compressed, &gpu_opts);

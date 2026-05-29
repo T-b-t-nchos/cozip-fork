@@ -184,12 +184,32 @@ struct DecodeScratch {
     bind_group: wgpu::BindGroup,
 }
 
+/// Returns true when the user requested a hard GPU disable via `COZIP_DISABLE_GPU`.
+///
+/// This is the cross-platform kill switch used to force CPU-only operation on
+/// machines with broken/headless GPU drivers (common on Linux servers and CI).
+/// Any value other than empty/`0`/`false` enables the disable.
+fn gpu_disabled_by_env() -> bool {
+    match std::env::var("COZIP_DISABLE_GPU") {
+        Ok(value) => {
+            let value = value.trim();
+            !(value.is_empty() || value == "0" || value.eq_ignore_ascii_case("false"))
+        }
+        Err(_) => false,
+    }
+}
+
 impl GpuAssist {
     pub(super) fn new(options: &HybridOptions) -> Result<Self, CozipDeflateError> {
         pollster::block_on(Self::new_async(options))
     }
 
     async fn new_async(options: &HybridOptions) -> Result<Self, CozipDeflateError> {
+        if gpu_disabled_by_env() {
+            return Err(CozipDeflateError::GpuUnavailable(
+                "GPU disabled by COZIP_DISABLE_GPU".to_string(),
+            ));
+        }
         let instance = wgpu::Instance::default();
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {

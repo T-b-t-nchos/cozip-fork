@@ -1990,3 +1990,31 @@ mode別GPU品質パラメータ:
 - PDeflate 単一ファイル stream header に任意の UTF-8 `file_name` metadata を追加した
 - 単一ファイル圧縮では元ファイル名を埋め込み、解凍時はその名前を優先して復元する
 - 旧ストリームで metadata がない場合は、従来どおりアーカイブ名 stem から復元名を推定する
+
+## 2026-05-29 Linux 完全対応・独自形式圧縮率向上・GPU速度維持
+
+### Linux を Windows と相違なくする対応
+- 作成側の Unix 非UTF8 パス名を Shift-JIS 復号して UTF-8 ZIP 名へ正規化（抽出側は既に UTF-8/Shift-JIS/CP437 対応済み）。Windows 相互運用を両方向で成立させた。
+- GNOME(Nautilus)/Cinnamon(Nemo)/MATE(Caja) 向けの右クリック「Scripts」連携を新規追加（`packaging/linux/filemanager-scripts/`）。KDE(Dolphin) サービスメニューと同等の 圧縮(ZIP/CoZip/詳細)・展開(ここに展開/詳細) を提供。
+  - 共通ヘルパーは scripts ディレクトリに置くとメニューへ露出するため、データディレクトリへ配置し各スクリプトから参照する方式にした。
+- `install.sh` / `uninstall.sh` を上記3デスクトップ環境へ拡張。一時 HOME での疑似インストール/アンインストールで検証。
+- GPU 堅牢性: `COZIP_DISABLE_GPU` キルスイッチを `cozip_deflate` と `cozip_pdeflate` 双方の GPU 初期化経路へ追加。ヘッドレス/ドライバ不良/CI で確実に CPU 経路へフォールバックする。
+
+### 独自形式(PDeflate)の圧縮率向上（後方互換）
+- 従来 `huffman_encode_enabled` 経路は identity LUT（全シンボル8bit固定＝実質無圧縮）だった。これを本物の正準 Huffman へ配線した。
+  - 基盤（頻度→符号長、正準コードブック、root+subtable LUT、LSB デコード、`encode_symbols_with_huffman_codebook`、GPU デコードシェーダの Huffman 復号）は実装済みで、finalize への配線のみが欠けていた。
+- 256シンボル alphabet で深さが 15bit を超え得るため、zlib `gen_bitlen` 方式の長さ制限 Huffman（`limit_code_lengths`）を追加。
+- セクションのビットストリーム枠組みを Huffman 用に拡張: 各セクションはバイト境界整列で格納し、正確な（非バイト整列の）bit_len を記録。デコード/preprocess のスライスを `huffman` 時 `ceil(bits/8)` へ変更。
+- チャンク単位で「Huffman版 vs 素版」のサイズを厳密比較し、小さい方を採用。フラグはチャンク単位のため旧ストリームは引き続き解凍可能（後方互換）。
+
+### GPU 速度を落とさないための工夫（バランス）
+- GPU はマッチ探索、CPU が finalize でエントロピー符号化する構造のため、Huffman 追加でも GPU 加速のマッチ段は不変。
+- 全チャンクで実エンコードすると圧縮が +75% 遅くなったため、頻度から利得を事前推定し、推定削減率が約5%以上のチャンクだけ実エンコードする賢いゲートを導入。
+  - bench データ(削減~2%)はゲートでスキップ → 圧縮速度・比率ともベースライン同等（速度劣化なし）。
+  - 偏ったリテラルデータでは 8〜17% 圧縮率向上（ローカル計測）。
+- `huffman_encode_enabled` を既定 ON 化。
+- 計測（RTX 4070 SUPER, size 1GiB, GPU compress, bench データ）: comp_ms 242→245（誤差内）、ratio 0.3944→0.3945（スキップにつき不変）。
+
+### 確認
+- クレート個別テストは全て通過（cozip 16, cozip_pdeflate 22, cozip_deflate 11）。GPU+Huffman の CPU/GPU デコード一致テストを追加。
+- ワークスペース一括テストは複数テストバイナリが同一 GPU を同時利用するため GPU 競合でフレーク化することがある。安定確認はクレート個別実行で行う。

@@ -8,6 +8,17 @@ MIME_ROOT="${HOME}/.local/share/mime"
 MIME_DIR="${MIME_ROOT}/packages"
 DATA_DIR="${HOME}/.local/share/cozip"
 ICON_DIR="${DATA_DIR}/icons"
+COZIP_FM_COMMON="${DATA_DIR}/filemanager-common.sh"
+NAUTILUS_SCRIPT_DIR="${HOME}/.local/share/nautilus/scripts"
+NEMO_SCRIPT_DIR="${HOME}/.local/share/nemo/scripts"
+CAJA_SCRIPT_DIR="${HOME}/.config/caja/scripts"
+FM_SCRIPT_NAMES=(
+  "CoZip Compress to ZIP"
+  "CoZip Compress to CoZip"
+  "CoZip Compress (options)"
+  "CoZip Extract Here"
+  "CoZip Extract (options)"
+)
 
 refresh_desktop_caches() {
   command -v update-desktop-database >/dev/null 2>&1 \
@@ -38,6 +49,13 @@ remove_file "$SERVICEMENU_DIR/cozip-10-extract-here.desktop"
 remove_file "$SERVICEMENU_DIR/cozip-20-extract-details.desktop"
 remove_file "$ICON_DIR/comp.ico"
 remove_file "$ICON_DIR/decomp.ico"
+remove_file "$COZIP_FM_COMMON"
+
+for dir in "$NAUTILUS_SCRIPT_DIR" "$NEMO_SCRIPT_DIR" "$CAJA_SCRIPT_DIR"; do
+  for name in "${FM_SCRIPT_NAMES[@]}"; do
+    remove_file "$dir/$name"
+  done
+done
 
 if [[ -d "$ICON_DIR" ]]; then
   rmdir "$ICON_DIR" 2>/dev/null || true
