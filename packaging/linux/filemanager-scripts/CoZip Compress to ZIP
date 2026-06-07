@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+source "@COZIP_FM_COMMON@"
+
+cozip_read_selection_into paths
+[[ ${#paths[@]} -eq 0 ]] && exit 0
+
+exec "$(cozip_desktop_bin)" compress --format zip --hybrid "${paths[@]}"

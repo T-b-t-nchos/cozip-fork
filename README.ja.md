@@ -34,6 +34,38 @@ cargo check --workspace
 cargo test --workspace
 ```
 
+> 注意: 一部の GPU テストはホスト GPU を共有します。ワークスペース一括テストを並列実行すると
+> GPU 競合でフレーク化することがあるため、安定確認はクレート個別（例: `cargo test -p cozip`）で
+> 行ってください。
+
+## Linux デスクトップ連携
+
+`packaging/linux/install.sh` は、デスクトップエントリ・MIME タイプ・KDE(Dolphin) サービスメニュー
+に加えて、GNOME(Nautilus)/Cinnamon(Nemo)/MATE(Caja) の右クリック「スクリプト」連携をインストール
+します。`packaging/linux/uninstall.sh` で削除できます。
+
+```bash
+./packaging/linux/install.sh          # 現在のユーザー向けにビルド＋インストール
+./packaging/linux/uninstall.sh
+```
+
+GNOME/Cinnamon/MATE では、圧縮/展開の各アクションが右クリックの **スクリプト** サブメニューに
+表示されます。Windows で作成された非UTF-8（例: Shift-JIS）のファイル名は、展開時に復号し、作成時に
+UTF-8 へ再エンコードして Windows と一致した挙動になります。
+
+## GPU キルスイッチ
+
+`COZIP_DISABLE_GPU=1` を設定すると CPU のみで動作します。ヘッドレスサーバ、GPU ドライバ不調、CI 向けの
+横断的な退避手段で、圧縮は透過的に CPU 経路へフォールバックします。
+
+## 独自形式の圧縮率（Huffman）
+
+PDeflate(`CoZip`)形式は、マッチ探索の後段に任意のチャンク単位 正準 Huffman エントロピー符号化を適用します。
+**後方互換**（フラグはチャンク単位で、旧ストリームは引き続き解凍可能）かつ **既定で有効** です。各チャンクは
+推定削減率がしきい値を超えたときだけ Huffman 化されるため、圧縮しにくい/効果の薄いデータは高速経路を維持し、
+GPU 加速のマッチ段にも影響しません。一方、偏ったデータでは目に見えて縮みます（ローカル計測で偏ったリテラル
+データに対し約8〜17%小さく）。GPU 解凍は Huffman チャンクを直接デコードします。
+
 ## `cozip_desktop` の引数
 
 引数なしで `cozip_desktop` を実行すると、デスクトップアプリの圧縮画面を開きます。

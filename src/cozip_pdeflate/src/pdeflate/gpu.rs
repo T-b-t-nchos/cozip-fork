@@ -2301,6 +2301,11 @@ impl GpuSparsePackScratch {
 }
 
 fn init_runtime() -> Result<GpuMatchRuntime, String> {
+    // Cross-platform kill switch: force CPU-only on broken/headless GPU drivers
+    // (common on Linux servers and CI). Mirrors cozip_deflate's gpu_disabled_by_env.
+    if env_flag_enabled("COZIP_DISABLE_GPU") {
+        return Err("GPU disabled by COZIP_DISABLE_GPU".to_string());
+    }
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,

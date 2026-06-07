@@ -34,6 +34,41 @@ cargo check --workspace
 cargo test --workspace
 ```
 
+> Note: several GPU tests share the host GPU. Running the whole workspace test in
+> parallel can flake under GPU contention; run per crate (e.g. `cargo test -p cozip`)
+> for stable results.
+
+## Linux desktop integration
+
+`packaging/linux/install.sh` installs the desktop entry, MIME type, KDE/Dolphin
+service menus, and right-click "Scripts" entries for GNOME (Nautilus), Cinnamon
+(Nemo) and MATE (Caja). `packaging/linux/uninstall.sh` removes them.
+
+```bash
+./packaging/linux/install.sh          # build + install for the current user
+./packaging/linux/uninstall.sh
+```
+
+On GNOME/Cinnamon/MATE the compress/extract actions appear under the right-click
+**Scripts** submenu. Non-UTF-8 (e.g. Shift-JIS) file names produced on Windows are
+decoded on extraction and re-encoded as UTF-8 on creation, matching Windows behavior.
+
+## GPU kill switch
+
+Set `COZIP_DISABLE_GPU=1` to force CPU-only operation. This is the cross-platform
+escape hatch for headless servers, broken GPU drivers, or CI; compression falls back
+to the CPU path transparently.
+
+## Custom-format compression ratio (Huffman)
+
+The PDeflate (`CoZip`) format applies an optional per-chunk canonical-Huffman entropy
+stage after match-finding. It is **backward compatible** (the flag is per-chunk; older
+streams keep decoding) and **on by default**: each chunk is Huffman-coded only when the
+estimated saving clears a threshold, so incompressible/marginal data keeps the fast path
+and the GPU-accelerated match stage is unaffected, while skewed data shrinks noticeably
+(~8–17% smaller on biased literal data in local measurements). GPU decompression
+decodes Huffman chunks directly.
+
 ## `cozip_desktop` Arguments
 
 Running `cozip_desktop` without arguments opens the desktop application on the
